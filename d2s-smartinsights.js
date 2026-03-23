@@ -550,6 +550,36 @@ function escapeHtmlJs(str) {
         .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
+/**
+ * Compares two date strings for equality, normalizing different formats.
+ * Handles M/d/yyyy vs MM/dd/yyyy vs yyyy-MM-dd etc.
+ * "1/1/2020" and "01/01/2020" are treated as equal.
+ * Two empty/null values are equal. One empty + one non-empty are not.
+ */
+function datesEqual(a, b) {
+    var sa = (a || "").trim();
+    var sb = (b || "").trim();
+    if (sa === sb) return true;
+    if (!sa && !sb) return true;
+    if (!sa || !sb) return false;
+
+    // Parse both to Date objects and compare timestamps
+    var da = new Date(sa);
+    var db = new Date(sb);
+    if (!isNaN(da.getTime()) && !isNaN(db.getTime())) {
+        return da.getFullYear() === db.getFullYear()
+            && da.getMonth() === db.getMonth()
+            && da.getDate() === db.getDate();
+    }
+
+    // If parsing fails, strip leading zeros and compare
+    // "01/01/2020" → "1/1/2020"
+    var normalize = function (s) {
+        return s.replace(/\b0+(\d)/g, "$1");
+    };
+    return normalize(sa) === normalize(sb);
+}
+
 // ====================================================================
 // Priority 2: Change Type Selection — Edit Evidence Modal
 // ====================================================================
@@ -593,14 +623,18 @@ function setupChangeTypeValidation(iframeDoc, iframe, targetDoc) {
 
             console.log("Smart Insights [EditEvidence]: Change type selected:", selectedType);
 
-            // Snapshot original field values
-            var originalValues = captureFieldValues(iframeDoc);
+            // Wait for the edit form to fully render before capturing
+            // field values and attaching listeners
+            setTimeout(function () {
+                // Snapshot original field values into hidden DOM inputs
+                var originalValues = captureFieldValues(iframeDoc);
 
-            // Show guidance banner
-            showChangeTypeGuidance(iframeDoc, selectedType);
+                // Show guidance banner
+                showChangeTypeGuidance(iframeDoc, selectedType);
 
-            // Set up save-time validation
-            setupEditEvidenceSaveValidation(iframeDoc, iframe, selectedType, originalValues);
+                // Set up real-time + save-time validation
+                setupEditEvidenceSaveValidation(iframeDoc, iframe, selectedType, originalValues);
+            }, 500);
         }
     }, 200);
 
@@ -608,21 +642,39 @@ function setupChangeTypeValidation(iframeDoc, iframe, targetDoc) {
 }
 
 /**
- * Captures original date field values from the evidence edit form.
- * Uses data-testid selectors (Curam pattern).
+ * Captures original date field values from the evidence edit form
+ * and stores them as hidden inputs in the iframe DOM so they persist
+ * and can be read back reliably during validation.
  */
 function captureFieldValues(iframeDoc) {
     var values = {};
+    var fields = {
+        effectiveDate: findEvidenceDateField(iframeDoc, "EffectiveDate"),
+        startDate: findEvidenceDateField(iframeDoc, "StartDate"),
+        endDate: findEvidenceDateField(iframeDoc, "EndDate")
+    };
 
-    var effectiveDate = findEvidenceDateField(iframeDoc, "EffectiveDate");
-    var startDate = findEvidenceDateField(iframeDoc, "StartDate");
-    var endDate = findEvidenceDateField(iframeDoc, "EndDate");
+    for (var key in fields) {
+        var field = fields[key];
+        var val = field ? (field.value || "") : "";
+        values[key] = val;
 
-    if (effectiveDate) values.effectiveDate = effectiveDate.value;
-    if (startDate) values.startDate = startDate.value;
-    if (endDate) values.endDate = endDate.value;
+        // Store as hidden input so the value persists in DOM
+        var hiddenId = "d2s-si-original-" + key;
+        var existing = iframeDoc.getElementById(hiddenId);
+        if (existing) {
+            existing.value = val;
+        } else {
+            var hidden = iframeDoc.createElement("input");
+            hidden.type = "hidden";
+            hidden.id = hiddenId;
+            hidden.name = hiddenId;
+            hidden.value = val;
+            iframeDoc.body.appendChild(hidden);
+        }
+    }
 
-    console.log("Smart Insights [EditEvidence]: Original values:", JSON.stringify(values));
+    console.log("Smart Insights [EditEvidence]: Original values stored:", JSON.stringify(values));
 
     // Diagnostic: list all date fields found
     var allDateFields = iframeDoc.querySelectorAll('[data-testid*="date_"], [data-testid*="Date"]');
@@ -636,6 +688,24 @@ function captureFieldValues(iframeDoc) {
 }
 
 /**
+ * Reads original values back from hidden inputs stored in the DOM.
+ * Fallback to the passed-in originalValues object.
+ */
+function getOriginalValues(iframeDoc, fallback) {
+    return {
+        effectiveDate: getHiddenOriginal(iframeDoc, "effectiveDate", fallback),
+        startDate: getHiddenOriginal(iframeDoc, "startDate", fallback),
+        endDate: getHiddenOriginal(iframeDoc, "endDate", fallback)
+    };
+}
+
+function getHiddenOriginal(iframeDoc, key, fallback) {
+    var hidden = iframeDoc.getElementById("d2s-si-original-" + key);
+    if (hidden && hidden.value !== undefined) return hidden.value;
+    return (fallback && fallback[key]) || "";
+}
+
+/**
  * Finds an evidence date field by searching data-testid for partial match.
  * Curam uses data-testid="date_Field.Label.EffectiveDate" etc.
  */
@@ -646,6 +716,7 @@ function findEvidenceDateField(iframeDoc, fieldName) {
 
 /**
  * Shows a guidance banner at the top of the form indicating selected change type.
+ * Consistent blue styling for all change types.
  */
 function showChangeTypeGuidance(iframeDoc, selectedType) {
     var labels = {
@@ -654,23 +725,14 @@ function showChangeTypeGuidance(iframeDoc, selectedType) {
         correction: "Correction"
     };
 
-    var colors = {
-        ending: { bg: "#fce4ec", border: "#c62828", text: "#b71c1c" },
-        changeOverTime: { bg: "#e3f2fd", border: "#1565c0", text: "#0d47a1" },
-        correction: { bg: "#fff3e0", border: "#e65100", text: "#bf360c" }
-    };
-
-    var c = colors[selectedType] || colors.correction;
-
     var guidanceHtml = '<div id="d2s-si-change-type-guidance" '
-        + 'style="background-color:' + c.bg + ';border-left:4px solid ' + c.border + ';'
+        + 'style="background-color:#e3f2fd;border-left:4px solid #1565c0;'
         + 'padding:10px 14px;margin:8px 0;border-radius:4px;font-size:13px;">'
-        + '<strong style="color:' + c.text + ';">Change Type: '
-        + labels[selectedType] + '</strong>'
+        + '<strong style="color:#0d47a1;">Change Type: '
+        + (labels[selectedType] || selectedType) + '</strong>'
         + ' &mdash; Date validations will be enforced based on your selection.'
         + '</div>';
 
-    // Try iframe first, then parent doc
     var formArea = iframeDoc.querySelector(".modal-content")
         || iframeDoc.querySelector("form")
         || iframeDoc.querySelector(".page-content")
@@ -688,8 +750,8 @@ function showChangeTypeGuidance(iframeDoc, selectedType) {
 }
 
 /**
- * Sets up save-time validation for the Edit Evidence form.
- * Uses findAllSaveButtons (searches both iframe and parent doc).
+ * Sets up both real-time (on field change) and save-time validation
+ * for the Edit Evidence form.
  */
 function setupEditEvidenceSaveValidation(iframeDoc, iframe, changeType, originalValues) {
     var rules = iframe.contentWindow.d2sValidationRules;
@@ -700,6 +762,30 @@ function setupEditEvidenceSaveValidation(iframeDoc, iframe, changeType, original
 
     console.log("Smart Insights [EditEvidence]: Save buttons for validation: " + saveButtons.length);
 
+    // --- Real-time validation: attach to each date field ---
+    var dateFields = [
+        findEvidenceDateField(iframeDoc, "EffectiveDate"),
+        findEvidenceDateField(iframeDoc, "StartDate"),
+        findEvidenceDateField(iframeDoc, "EndDate")
+    ];
+
+    function runRealtimeValidation() {
+        var errors = validateEvidenceFields(iframeDoc, typeRules, originalValues);
+        // Clear previous tooltips first
+        clearFieldErrorTooltips(iframeDoc);
+        if (errors.length > 0) {
+            showFieldErrorTooltips(iframeDoc, errors);
+        }
+    }
+
+    for (var f = 0; f < dateFields.length; f++) {
+        if (dateFields[f]) {
+            dateFields[f].addEventListener("change", runRealtimeValidation);
+            dateFields[f].addEventListener("blur", runRealtimeValidation);
+        }
+    }
+
+    // --- Save-time validation: block save if errors ---
     for (var i = 0; i < saveButtons.length; i++) {
         attachEvidenceValidation(saveButtons[i], iframeDoc, typeRules, originalValues);
     }
@@ -741,11 +827,15 @@ function attachEvidenceValidation(button, iframeDoc, typeRules, originalValues) 
 
 /**
  * Validates evidence date fields against rules for the selected change type.
- * Returns an array of error objects: { message, field } so callers can
- * show both a top-level error banner and inline tooltips per field.
+ * Reads original values from hidden DOM inputs (stored by captureFieldValues)
+ * to ensure reliable comparison even if the JS closure was lost.
+ * Returns an array of { message, field } objects.
  */
 function validateEvidenceFields(iframeDoc, typeRules, originalValues) {
     var errors = [];
+
+    // Read originals from hidden inputs (reliable) with fallback to closure
+    var originals = getOriginalValues(iframeDoc, originalValues);
 
     var effectiveDate = findEvidenceDateField(iframeDoc, "EffectiveDate");
     var startDate = findEvidenceDateField(iframeDoc, "StartDate");
@@ -753,7 +843,7 @@ function validateEvidenceFields(iframeDoc, typeRules, originalValues) {
 
     // Effective Date locked: must not change from original
     if (typeRules.effectiveDateLocked && effectiveDate) {
-        if (effectiveDate.value !== (originalValues.effectiveDate || "")) {
+        if (!datesEqual(effectiveDate.value, originals.effectiveDate)) {
             errors.push({
                 message: typeRules.effectiveDateError
                     || "The Effective Date must not be changed.",
@@ -775,7 +865,7 @@ function validateEvidenceFields(iframeDoc, typeRules, originalValues) {
 
     // Start Date locked: must not change from original
     if (typeRules.startDateLocked && startDate) {
-        if (startDate.value !== (originalValues.startDate || "")) {
+        if (!datesEqual(startDate.value, originals.startDate)) {
             errors.push({
                 message: typeRules.startDateError
                     || "The Start Date must not be changed.",
@@ -835,10 +925,11 @@ function showValidationErrors(iframeDoc, errors) {
     }
 }
 
+// Track fields we've highlighted so we can reliably clear them
+var _d2sHighlightedFields = [];
+
 /**
  * Shows an inline error tooltip below each failing date field.
- * Uses the same container-walking approach as showDateTooltip to
- * avoid overlapping the Curam date picker widget.
  */
 function showFieldErrorTooltips(iframeDoc, errors) {
     clearFieldErrorTooltips(iframeDoc);
@@ -866,6 +957,9 @@ function showFieldErrorTooltips(iframeDoc, errors) {
         err.field.style.borderColor = "#c62828";
         err.field.style.borderWidth = "2px";
         err.field.style.boxShadow = "0 0 4px rgba(198, 40, 40, 0.4)";
+
+        // Track for cleanup
+        _d2sHighlightedFields.push(err.field);
     }
 }
 
@@ -873,18 +967,26 @@ function showFieldErrorTooltips(iframeDoc, errors) {
  * Removes all inline field error tooltips and resets field styling.
  */
 function clearFieldErrorTooltips(iframeDoc) {
+    // Remove tooltip elements
     var tips = iframeDoc.querySelectorAll(".d2s-si-field-error-tooltip");
     for (var i = 0; i < tips.length; i++) {
         tips[i].remove();
     }
-    // Reset any red-highlighted fields
-    var highlighted = iframeDoc.querySelectorAll(
-        '[style*="border-color: rgb(198, 40, 40)"], [style*="border-color:#c62828"]');
-    for (var j = 0; j < highlighted.length; j++) {
-        highlighted[j].style.borderColor = "";
-        highlighted[j].style.borderWidth = "";
-        highlighted[j].style.boxShadow = "";
+
+    // Reset all tracked highlighted fields
+    for (var j = 0; j < _d2sHighlightedFields.length; j++) {
+        var f = _d2sHighlightedFields[j];
+        if (f && f.style) {
+            f.style.borderColor = "";
+            f.style.borderWidth = "";
+            f.style.boxShadow = "";
+        }
     }
+    _d2sHighlightedFields = [];
+
+    // Also remove the top-level error banner
+    var banner = iframeDoc.getElementById("d2s-si-validation-errors");
+    if (banner) banner.remove();
 }
 
 // ====================================================================
